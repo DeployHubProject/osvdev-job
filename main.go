@@ -452,6 +452,11 @@ func newVuln(content map[string]interface{}) (bool, error) {
 		return false, nil
 	}
 
+	// Record the normalized base purl of every affected entry on the document.
+	// The backend finds a package's CVEs through an index on it when it builds
+	// edges lazily (LAZY_CVE_EDGES), so it must be stored with the CVE.
+	annotateBasePurls(content)
+
 	// Upsert CVE document
 	upsertQuery := `
 		UPSERT { _key: @key } 
@@ -470,8 +475,14 @@ func newVuln(content map[string]interface{}) (bool, error) {
 		return false, err
 	}
 
-	// Populate cve2purl Hub edges
-	processEdges(ctx, content)
+	// Populate cve2purl Hub edges. The CVE document is written above, before any
+	// edge: in lazy mode the backend does the opposite for a newly referenced
+	// package (package and sbom2purl edge first, then the CVE lookup), so
+	// whichever side goes second sees the other's write and one of them creates
+	// the edge.
+	if err := processEdges(ctx, content); err != nil {
+		logger.Sugar().Errorf("cve2purl edges for %s were not written: %v", id, err)
+	}
 
 	return true, nil
 }
@@ -563,6 +574,89 @@ func resolvePURL(affMap map[string]interface{}, content map[string]interface{}) 
 	return ""
 }
 
+// lazyEdgesEnabled reports whether edges are written lazily (LAZY_CVE_EDGES=true):
+// only for packages an SBOM already references, instead of for every package of
+// every advisory.
+func lazyEdgesEnabled() bool {
+	return strings.EqualFold(os.Getenv("LAZY_CVE_EDGES"), "true")
+}
+
+// entryBasePurl returns the base purl of an affected entry: the value stored on
+// it by annotateBasePurls, or resolved from the entry.
+func entryBasePurl(affMap map[string]interface{}, content map[string]interface{}) string {
+	if p, ok := affMap["base_purl"].(string); ok && p != "" {
+		return p
+	}
+	return resolvePURL(affMap, content)
+}
+
+// annotateBasePurls stores the resolved base purl on each affected entry as
+// base_purl, so it is written with the CVE document.
+func annotateBasePurls(content map[string]interface{}) {
+	affected, _ := content["affected"].([]interface{})
+	for _, item := range affected {
+		aff, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if p := resolvePURL(aff, content); p != "" {
+			aff["base_purl"] = p
+		}
+	}
+}
+
+// findActiveHubs returns, for the base purls of a CVE's affected entries, the
+// package nodes (purl -> "purl/<key>") that an SBOM references, i.e. that have
+// an sbom2purl edge pointing at them.
+func findActiveHubs(ctx context.Context, affected []interface{}, content map[string]interface{}) (map[string]string, error) {
+	seen := make(map[string]bool)
+	var purls []string
+	for _, item := range affected {
+		aff, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if p := entryBasePurl(aff, content); p != "" && !seen[p] {
+			seen[p] = true
+			purls = append(purls, p)
+		}
+	}
+
+	active := make(map[string]string)
+	if len(purls) == 0 {
+		return active, nil
+	}
+
+	// purl has a unique index on its purl attribute, and sbom2purl an edge
+	// index on _to, so this is a handful of index lookups per CVE.
+	const query = `
+		FOR p IN @purls
+			FOR h IN purl
+				FILTER h.purl == p
+				FILTER LENGTH(FOR s IN sbom2purl FILTER s._to == h._id LIMIT 1 RETURN 1) > 0
+				RETURN { purl: p, id: h._id }
+	`
+	cursor, err := dbconn.Database.Query(ctx, query, &arangodb.QueryOptions{
+		BindVars: map[string]interface{}{"purls": purls},
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close()
+
+	for cursor.HasMore() {
+		var row struct {
+			Purl string `json:"purl"`
+			ID   string `json:"id"`
+		}
+		if _, err := cursor.ReadDocument(ctx, &row); err != nil {
+			return nil, err
+		}
+		active[row.Purl] = row.ID
+	}
+	return active, nil
+}
+
 // edgeVersionKeys are the numeric version parts a cve2purl edge may carry.
 var edgeVersionKeys = []string{
 	"introduced_major", "introduced_minor", "introduced_patch",
@@ -592,48 +686,77 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 		return nil
 	}
 
+	// Lazy mode: only packages some SBOM already references get edges, so the
+	// loader never creates package nodes or edges for packages no release
+	// contains. A package that is first referenced later gets its edges from
+	// the backend (sbom.EnsureCVEEdgesForPurls), found through base_purl.
+	lazy := lazyEdgesEnabled()
+	var activeHubs map[string]string
+	if lazy {
+		var err error
+		activeHubs, err = findActiveHubs(ctx, affected, content)
+		if err != nil {
+			return fmt.Errorf("looking up referenced packages: %w", err)
+		}
+		if len(activeHubs) == 0 {
+			return nil
+		}
+	}
+
 	for _, affItem := range affected {
 		affMap, ok := affItem.(map[string]interface{})
 		if !ok {
 			continue
 		}
 
-		basePurl := resolvePURL(affMap, content)
+		basePurl := entryBasePurl(affMap, content)
 		if basePurl == "" {
 			logger.Sugar().Warnf("Could not resolve PURL for CVE %s, skipping affected entry", cveID)
 			continue
 		}
 
 		purlKey := util.SanitizeKey(basePurl)
-		purlNode := map[string]interface{}{
-			"_key":    purlKey,
-			"purl":    basePurl,
-			"objtype": "PURL",
-		}
-
-		purlUpsertQuery := `
-			UPSERT { _key: @key }
-			INSERT @doc
-			UPDATE {}
-			IN purl
-		`
-		if _, err := dbconn.Database.Query(ctx, purlUpsertQuery, &arangodb.QueryOptions{
-			BindVars: map[string]interface{}{
-				"key": purlKey,
-				"doc": purlNode,
-			},
-		}); err != nil {
-			// Don't create a cve2purl edge pointing at a purl document
-			// that was never actually written -- that produces a
-			// permanently-dangling edge (ArangoDB doesn't enforce
-			// referential integrity on edge collections), which repair
-			// would then "fix" and immediately recreate as dangling
-			// again on every subsequent run, forever.
-			logger.Sugar().Warnf("Failed to upsert purl document %q for CVE %s, skipping edge: %v", basePurl, cveID, err)
-			continue
-		}
-
 		purlDocID := "purl/" + purlKey
+
+		if lazy {
+			// Use the package node the SBOM side created (found by its unique
+			// purl), not one keyed by us: a node the backend created first has
+			// an auto-generated key, and inserting a second one with the same
+			// purl is rejected by the unique index on purl.
+			hubID, active := activeHubs[basePurl]
+			if !active {
+				continue
+			}
+			purlDocID = hubID
+		} else {
+			purlNode := map[string]interface{}{
+				"_key":    purlKey,
+				"purl":    basePurl,
+				"objtype": "PURL",
+			}
+
+			purlUpsertQuery := `
+				UPSERT { _key: @key }
+				INSERT @doc
+				UPDATE {}
+				IN purl
+			`
+			if _, err := dbconn.Database.Query(ctx, purlUpsertQuery, &arangodb.QueryOptions{
+				BindVars: map[string]interface{}{
+					"key": purlKey,
+					"doc": purlNode,
+				},
+			}); err != nil {
+				// Don't create a cve2purl edge pointing at a purl document
+				// that was never actually written -- that produces a
+				// permanently-dangling edge (ArangoDB doesn't enforce
+				// referential integrity on edge collections), which repair
+				// would then "fix" and immediately recreate as dangling
+				// again on every subsequent run, forever.
+				logger.Sugar().Warnf("Failed to upsert purl document %q for CVE %s, skipping edge: %v", basePurl, cveID, err)
+				continue
+			}
+		}
 
 		ranges, _ := affMap["ranges"].([]interface{})
 		if len(ranges) == 0 {

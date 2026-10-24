@@ -36,6 +36,10 @@ http:
   maxAttempts: 3
   maxBodyMB: 2048
 
+# Write cve2purl edges only for packages an SBOM already references (see the
+# README, "Lazy Edges"). Enable together with LAZY_CVE_EDGES on the backend.
+lazyCveEdges: true
+
 extraEnv: []
 
 # Sized to co-schedule both CronJobs on one e2-standard-2 batch node

@@ -5,7 +5,7 @@ go 1.26.4
 require (
 	github.com/arangodb/go-driver/v2 v2.4.1
 	github.com/google/osv-scanner v1.9.2
-	github.com/ortelius/ortelius/v12 v12.0.539
+	github.com/ortelius/ortelius/v12 v12.0.541
 )
 
 require (

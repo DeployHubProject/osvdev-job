@@ -53,6 +53,8 @@ spec:
               env:
                 - name: MITRE_MAPPING_URL
                   value: "{{ .Values.mitreMappingUrl | default "" }}"
+                - name: LAZY_CVE_EDGES
+                  value: {{ .Values.lazyCveEdges | default false | quote }}
                 - name: ARANGO_USER
                   valueFrom:
                     secretKeyRef:

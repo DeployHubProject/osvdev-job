@@ -32,6 +32,12 @@ The loader tracks the last processed modification timestamp per ecosystem in Ara
 
 High-water-mark records are stored in the shared `metadata` collection (one document per ecosystem, keyed by ecosystem name, e.g. `npm`, `pypi`) — the same collection the main Ortelius backend exposes generically via `GET/PUT /api/v1/metadata/:key`. Avoid writing to a key that matches an OSV ecosystem name through that API, as it will overwrite this job's high-water mark and force a full reprocess of that ecosystem's feed on the next run.
 
+## Lazy Edges (`LAZY_CVE_EDGES`)
+
+By default the loader writes a `purl` node and a `cve2purl` edge for every package of every advisory, which for container-distro feeds means millions of edges for packages no release contains. With `LAZY_CVE_EDGES=true` it only writes them for packages an SBOM already references (a `purl` node with an `sbom2purl` edge pointing at it). It uses the existing node found by its unique `purl`, and never creates package nodes. A package that is referenced for the first time later gets its edges from the backend (`sbom.EnsureCVEEdgesForPurls`, also `LAZY_CVE_EDGES`).
+
+Both modes store the normalized base purl of each affected entry on the CVE document as `affected[].base_purl`; the backend finds a package's CVEs through an index on it. The CVE document is always written before any edge, which together with the backend's ordering (package and `sbom2purl` edge first, then the CVE lookup) means a CVE is never missed whichever side runs second. The loader skips records whose OSV `modified` time is unchanged, so CVEs ingested before this change do not get `base_purl` until they are repaired (`repair --backfill-base-purls`).
+
 ## Data Integrity Repair
 
 After every ingestion run, the job performs a targeted repair pass (`RunRepair`, in `repair.go`) for dangling graph edges — `cve2purl` or `release2cve` edges left pointing at a `purl` or `cve` document that no longer exists (e.g. after manual cleanup or a partial failure elsewhere). It only touches the specific subset of edges currently broken, reusing the same `processEdges`/`newVuln` logic as normal ingestion, so it's safe and cheap to run on every execution — once something is fixed, the detection scan simply stops finding it.
