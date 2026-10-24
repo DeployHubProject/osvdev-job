@@ -563,9 +563,25 @@ func resolvePURL(affMap map[string]interface{}, content map[string]interface{}) 
 	return ""
 }
 
+// edgeVersionKeys are the numeric version parts a cve2purl edge may carry.
+var edgeVersionKeys = []string{
+	"introduced_major", "introduced_minor", "introduced_patch",
+	"fixed_major", "fixed_minor", "fixed_patch",
+	"last_affected_major", "last_affected_minor", "last_affected_patch",
+}
+
 // processEdges populates purl hub nodes and cve2purl edges.
-// Only SEMVER ranges are stored — GIT ranges are skipped as commit SHAs
-// cannot be used for semver version range matching.
+// SEMVER and ECOSYSTEM ranges are stored; GIT ranges are skipped as commit SHAs
+// cannot be used for version range matching.
+//
+// ECOSYSTEM ranges (PyPI, Maven, NuGet, RubyGems, Debian, ...) use the
+// ecosystem's own version ordering, which is not semver (PEP 440 pre/post
+// releases and epochs, Maven qualifiers, ...). Their edge therefore carries no
+// numeric version parts, which makes the matching queries hand every candidate
+// to util.IsVersionAffected -- the ecosystem-aware check that also honours the
+// advisory's explicit versions list -- instead of comparing major/minor/patch
+// in AQL. Skipping these ranges (as this used to) left no cve2purl edge at all,
+// so no release was ever linked to the CVE.
 func processEdges(ctx context.Context, content map[string]interface{}) error {
 	cveID, _ := content["id"].(string)
 	cveKey := util.SanitizeKey(cveID)
@@ -624,6 +640,16 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 			continue
 		}
 
+		// An entry with any ECOSYSTEM range is validated precisely in Go for
+		// all of its ranges, so none of its edges may carry numeric parts.
+		hasEcosystemRange := false
+		for _, rangeItem := range ranges {
+			if rm, ok := rangeItem.(map[string]interface{}); ok && rm["type"] == "ECOSYSTEM" {
+				hasEcosystemRange = true
+				break
+			}
+		}
+
 		for _, rangeItem := range ranges {
 			rangeMap, ok := rangeItem.(map[string]interface{})
 			if !ok {
@@ -632,9 +658,9 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 
 			rangeType, _ := rangeMap["type"].(string)
 
-			// Only process SEMVER ranges — GIT ranges use commit SHAs
-			// which cannot be used for semver version matching
-			if rangeType != "SEMVER" {
+			// Only process SEMVER and ECOSYSTEM ranges — GIT ranges use commit
+			// SHAs which cannot be used for version matching
+			if rangeType != "SEMVER" && rangeType != "ECOSYSTEM" {
 				continue
 			}
 
@@ -700,6 +726,13 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 			}
 			if lastAffectedParsed.Patch != nil {
 				edge["last_affected_patch"] = *lastAffectedParsed.Patch
+			}
+			if hasEcosystemRange {
+				// Explicit nulls (not omission): the upsert below merges into
+				// an existing edge, and stale numbers would otherwise survive.
+				for _, k := range edgeVersionKeys {
+					edge[k] = nil
+				}
 			}
 
 			// UPSERT instead of check-then-create: one round-trip instead
@@ -863,6 +896,12 @@ func updateReleaseEdgesForCVE(ctx context.Context, cveKey string) error {
 
 		if cand.NeedsValidation {
 			affectedData := cveAffectedMap[cveKey]
+			if len(affectedData) == 0 {
+				// The version cannot be validated, so do not guess: linking
+				// every installed version of the package would be a false
+				// positive for most of them.
+				continue
+			}
 			if len(affectedData) > 0 {
 				matchFound := false
 				for _, affected := range affectedData {

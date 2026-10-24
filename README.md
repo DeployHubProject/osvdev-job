@@ -8,7 +8,7 @@ On each run the loader fetches the full list of ecosystems published by osv.dev,
 
 1. Normalizes the vulnerability record — package names, version ranges, CVE/GHSA alias mappings, and CVSS scores
 2. Upserts the record into ArangoDB, skipping entries whose modification timestamp has not changed since the last run
-3. Builds `cve2purl` hub edges linking each CVE to the package PURLs it affects, with parsed version range metadata for fast query-time matching — only `SEMVER`-type ranges get this treatment; `GIT`-type ranges (commit-SHA based, common for C/C++ advisories) are used for PURL resolution but skipped for edge creation, since commit SHAs can't be compared as semantic versions
+3. Builds `cve2purl` hub edges linking each CVE to the package PURLs it affects. `SEMVER` ranges carry parsed major/minor/patch metadata for fast query-time matching. `ECOSYSTEM` ranges (PyPI, Maven, NuGet, RubyGems, Debian, …) use the ecosystem's own version ordering, which is not semver, so their edge carries no numeric parts and every candidate version is validated with the ecosystem-aware `util.IsVersionAffected` (which also honours the advisory's explicit `versions` list). `GIT`-type ranges (commit-SHA based, common for C/C++ advisories) are used for PURL resolution but skipped for edge creation, since commit SHAs can't be compared as versions
 4. Rebuilds `release2cve` materialized edges — connecting any existing release records whose SBOM packages fall within the affected version ranges
 5. Updates lifecycle tracking records for all active endpoints, recording whether each CVE was disclosed before or after the software was deployed
 
