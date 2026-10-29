@@ -1,12 +1,16 @@
-FROM cgr.dev/chainguard/go@sha256:552969bb3988f3db46a00880e912402aeb1d394dc26257f688ee5103ef39d16b AS builder
+FROM public.ecr.aws/amazonlinux/amazonlinux:2027.0.20261026.1-minimal AS builder
 
 WORKDIR /app
+
+RUN microdnf install -y golang git && \
+    microdnf clean all
+
 COPY . /app
 
 RUN go mod tidy; \
     go build -o main .
 
-FROM cgr.dev/chainguard/glibc-dynamic@sha256:530fc40b687b95f6c5e8a9b62da03306754da5ef45178e632b7486603bfb7096
+FROM public.ecr.aws/amazonlinux/amazonlinux:2027.0.20261026.1-minimal
 
 WORKDIR /app
 
@@ -16,6 +20,9 @@ ENV ARANGO_HOST=localhost
 ENV ARANGO_USER=root
 ENV ARANGO_PASS=rootpassword
 ENV ARANGO_PORT=8529
+
+# The Chainguard runtime image ran as non-root by default; Amazon Linux does not.
+USER 65532:65532
 
 EXPOSE 8080
 
